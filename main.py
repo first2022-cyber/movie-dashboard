@@ -1,207 +1,372 @@
 
-# 어제의 박스오피스 — KOBIS 일별 박스오피스 API
-# 초보자 안내:
-# 1. Streamlit Cloud의 Settings > Secrets에 KOBIS_KEY를 등록합니다.
-# 2. 실제 인증키는 코드에 직접 적지 않습니다.
-# 3. requirements.txt에 추가 라이브러리를 적습니다.
-
-import datetime
-import requests
-import pandas as pd
-import plotly.express as px
 import streamlit as st
+import requests
+import urllib.parse
+import streamlit.components.v1 as components
 
-st.set_page_config(page_title="어제의 박스오피스", page_icon="🎬", layout="wide")
-
-API_URL = (
-    "https://www.kobis.or.kr/kobisopenapi/webservice/rest/"
-    "boxoffice/searchDailyBoxOfficeList.json"
+# ----------------------------------
+# 기본 설정
+# ----------------------------------
+st.set_page_config(
+    page_title="PubChem 물질 탐구",
+    page_icon="⚗️",
+    layout="wide"
 )
 
-# 서버 시간대와 관계없이 한국 시간(UTC+9) 기준으로 어제를 계산합니다.
-KST = datetime.timezone(datetime.timedelta(hours=9))
-today_kst = datetime.datetime.now(KST).date()
-yesterday = today_kst - datetime.timedelta(days=1)
+BASE_URL = "https://pubchem.ncbi.nlm.nih.gov/rest/pug"
+TIMEOUT = 20
 
-st.title("🎬 일별 박스오피스")
-st.caption("달력에서 날짜를 선택하세요. 가장 늦게 선택할 수 있는 날짜는 한국 시간 기준 어제입니다.")
-selected_date = st.date_input(
-    "조회 날짜",
-    value=yesterday,
-    min_value=datetime.date(2004, 1, 1),
-    max_value=yesterday,
-    format="YYYY/MM/DD"
-)
-target_dt = selected_date.strftime("%Y%m%d")
-display_date = selected_date.strftime("%Y년 %m월 %d일")
+# ----------------------------------
+# PubChem API 함수
+# ----------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def search_compound(name):
+    """물질 이름으로 CID 검색"""
+    encoded_name = urllib.parse.quote(name, safe="")
+    url = f"{BASE_URL}/compound/name/{encoded_name}/cids/JSON"
 
-# 인증키는 Streamlit 비밀 금고(Secrets)에서만 불러옵니다.
-try:
-    API_KEY = st.secrets["KOBIS_KEY"]
-except Exception:
-    st.error("🔐 KOBIS 인증키를 찾을 수 없습니다.")
-    st.markdown(
-        "Streamlit Cloud의 **Settings → Secrets**에 `KOBIS_KEY`가 등록되어 있는지 확인하세요."
+    response = requests.get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+    data = response.json()
+
+    cids = data.get("IdentifierList", {}).get("CID", [])
+    if not cids:
+        return None
+
+    return cids[0]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_properties(cid):
+    """분자식과 분자량 조회"""
+    url = (
+        f"{BASE_URL}/compound/cid/{cid}"
+        "/property/MolecularFormula,MolecularWeight/JSON"
     )
-    st.code('KOBIS_KEY = "발급받은_인증키"', language="toml")
-    st.stop()
+
+    response = requests.get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+    data = response.json()
+
+    properties = data.get("PropertyTable", {}).get("Properties", [])
+    return properties[0] if properties else None
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_boxoffice(date_text, api_key):
-    """KOBIS API를 호출해 JSON 응답을 가져옵니다."""
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_2d_image(cid):
+    """2D 구조 이미지 가져오기"""
+    url = f"{BASE_URL}/compound/cid/{cid}/PNG"
+    response = requests.get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+    return response.content
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_3d_structure(cid):
+    """계산된 3D 구조(SDF) 가져오기"""
+    url = f"{BASE_URL}/compound/cid/{cid}/SDF"
     response = requests.get(
-        API_URL,
-        params={"key": api_key, "targetDt": date_text},
-        timeout=20
+        url,
+        params={"record_type": "3d"},
+        timeout=TIMEOUT
     )
     response.raise_for_status()
-    return response.json()
+
+    sdf = response.text
+
+    # 정상적인 SDF 구조인지 간단히 확인
+    if "M  END" not in sdf and "V2000" not in sdf and "V3000" not in sdf:
+        return None
+
+    return sdf
 
 
-# 요청 실패 시 빈 화면 대신 원인과 확인 방법을 표시합니다.
-try:
-    with st.spinner("KOBIS에서 데이터를 불러오는 중입니다..."):
-        data = fetch_boxoffice(target_dt, str(API_KEY).strip())
-except requests.exceptions.Timeout:
-    st.error("⏱️ KOBIS 서버 응답 시간이 초과되었습니다.")
-    st.info("인터넷 연결을 확인하고 잠시 후 새로고침해 주세요.")
-    st.stop()
-except requests.exceptions.HTTPError as error:
-    st.error("🌐 KOBIS 서버가 HTTP 오류를 반환했습니다.")
-    st.write(f"오류 내용: {error}")
-    st.info("KOBIS 서비스 상태와 요청 주소를 확인해 주세요.")
-    st.stop()
-except requests.exceptions.RequestException as error:
-    st.error("🌐 KOBIS 서버에 연결하지 못했습니다.")
-    st.write(f"오류 내용: {error}")
-    st.info("인터넷 연결, 방화벽, KOBIS API 서비스 상태를 확인해 주세요.")
-    st.stop()
-except ValueError:
-    st.error("📦 KOBIS 응답을 JSON으로 읽지 못했습니다.")
-    st.info("잠시 후 다시 시도하거나 KOBIS API 상태를 확인해 주세요.")
-    st.stop()
-except Exception as error:
-    st.error("예상하지 못한 문제가 발생했습니다.")
-    st.write(f"오류 내용: {error}")
-    st.info("앱 설정과 실행 로그를 확인해 주세요.")
-    st.stop()
+# ----------------------------------
+# 화면 디자인
+# ----------------------------------
+st.markdown("""
+<style>
+    .main-title {
+        font-size: 2.2rem;
+        font-weight: 800;
+        color: #365c45;
+        margin-bottom: 0.2rem;
+    }
+    .sub-title {
+        color: #68766c;
+        font-size: 1rem;
+        margin-bottom: 1.5rem;
+    }
+    div[data-testid="stMetric"] {
+        background: #f4f8f3;
+        border: 1px solid #dce8da;
+        padding: 16px;
+        border-radius: 12px;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-# 인증키가 틀려도 HTTP 상태코드가 200일 수 있으므로 faultInfo를 확인합니다.
-if not isinstance(data, dict):
-    st.error("KOBIS에서 예상한 형식의 데이터를 받지 못했습니다.")
-    st.info("잠시 후 다시 시도하고 KOBIS API 응답을 확인해 주세요.")
-    st.stop()
+st.markdown(
+    '<div class="main-title">⚗️ PubChem 물질 탐구</div>',
+    unsafe_allow_html=True
+)
+st.markdown(
+    '<div class="sub-title">'
+    '물질 이름으로 분자 정보와 2D·3D 구조를 탐색해 보세요.'
+    '</div>',
+    unsafe_allow_html=True
+)
 
-if "faultInfo" in data:
-    fault = data.get("faultInfo") or {}
-    if isinstance(fault, dict):
-        code = fault.get("errorCode", "정보 없음")
-        message = fault.get("message", "오류 메시지가 없습니다.")
+st.info(
+    "미국 국립보건원(NIH)의 PubChem 데이터를 이용합니다. "
+    "API 키는 필요하지 않으며, 인터넷 연결이 필요합니다."
+)
+
+# ----------------------------------
+# 검색 영역
+# ----------------------------------
+examples = {
+    "직접 입력": "",
+    "물 (Water)": "water",
+    "포도당 (Glucose)": "glucose",
+    "염화나트륨 (Sodium chloride)": "sodium chloride",
+    "이산화탄소 (Carbon dioxide)": "carbon dioxide",
+    "메탄 (Methane)": "methane",
+    "구연산 (Citric acid)": "citric acid",
+}
+
+left, right = st.columns([2, 1])
+
+with left:
+    selected = st.selectbox(
+        "🔎 예시 물질",
+        options=list(examples.keys()),
+        index=0
+    )
+
+with right:
+    st.markdown(" ")
+    st.markdown(" ")
+    st.caption("예시를 선택하거나 직접 검색할 수 있습니다.")
+
+default_name = examples[selected]
+
+with st.form("search_form"):
+    compound_name = st.text_input(
+        "물질 이름",
+        value=default_name,
+        placeholder="예: water, glucose, sodium chloride"
+    )
+    submitted = st.form_submit_button(
+        "🔍 물질 정보 검색",
+        type="primary",
+        use_container_width=True
+    )
+
+# 검색 결과를 세션에 보관
+if submitted:
+    if not compound_name.strip():
+        st.warning("검색할 물질 이름을 입력해 주세요.")
     else:
-        code, message = "정보 없음", str(fault)
-    st.error("🚨 KOBIS API가 오류 정보를 반환했습니다.")
-    st.write(f"오류 코드: {code}")
-    st.write(f"오류 메시지: {message}")
-    st.markdown(
-        "**확인할 사항:** Secrets의 이름이 `KOBIS_KEY`인지, 인증키가 올바른지, "
-        "조회 날짜가 `YYYYMMDD` 형식인지 확인하세요."
-    )
-    st.stop()
+        st.session_state["compound_name"] = compound_name.strip()
+        st.session_state["compound_search_requested"] = True
 
-boxoffice_result = data.get("boxOfficeResult", {})
-if not isinstance(boxoffice_result, dict):
-    boxoffice_result = {}
-movies = boxoffice_result.get("dailyBoxOfficeList", [])
+# ----------------------------------
+# 검색 결과 표시
+# ----------------------------------
+if st.session_state.get("compound_search_requested", False):
+    name = st.session_state.get("compound_name", "")
 
-if not movies:
-    st.warning("📭 그날은 아직 집계 전입니다.")
-    st.info(
-        "KOBIS에서 해당 날짜의 박스오피스 집계를 완료했는지 확인해 주세요. "
-        "날짜를 다시 선택하거나 잠시 후 새로고침할 수 있습니다."
-    )
-    st.stop()
+    try:
+        with st.spinner("PubChem에서 물질 정보를 가져오는 중입니다..."):
+            cid = search_compound(name)
 
-df = pd.DataFrame(movies)
+            if cid is None:
+                st.warning(
+                    "검색 결과가 없습니다. 영문 물질 이름이나 "
+                    "다른 표기를 사용해 보세요."
+                )
+                st.stop()
 
-# 필요한 항목이 응답에 있는지 먼저 확인합니다.
-required = ["rank", "rankInten", "movieNm", "openDt", "audiCnt", "audiAcc", "scrnCnt"]
-missing = [column for column in required if column not in df.columns]
-if missing:
-    st.error("KOBIS 응답에 필요한 항목이 없습니다: " + ", ".join(missing))
-    st.info("KOBIS API 응답 구조가 변경되었는지 공식 문서를 확인해 주세요.")
-    st.stop()
+            properties = get_properties(cid)
 
-# 숫자가 문자열로 오므로 정수로 변환합니다.
-for column in ["rank", "rankInten", "audiCnt", "audiAcc", "scrnCnt"]:
-    df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0).astype(int)
+        if not properties:
+            st.error("물질의 기본 정보를 가져오지 못했습니다.")
+            st.stop()
 
-df["movieNm"] = df["movieNm"].fillna("영화명 없음").astype(str)
-df["openDt"] = df["openDt"].fillna("-").replace("", "-").astype(str)
+        formula = properties.get("MolecularFormula", "정보 없음")
+        weight = properties.get("MolecularWeight", "정보 없음")
 
-# 누적 관객수가 100만 명을 초과한 영화명에는 트로피 이모지를 붙입니다.
-df["표시 영화명"] = df.apply(
-    lambda row: f"{row['movieNm']} 🏆" if row["audiAcc"] > 1_000_000 else row["movieNm"],
-    axis=1
+        st.divider()
+        st.subheader(f"📋 {name} 검색 결과")
+
+        metric1, metric2, metric3 = st.columns(3)
+
+        with metric1:
+            st.metric("분자식", formula)
+
+        with metric2:
+            if weight != "정보 없음":
+                st.metric("분자량", f"{float(weight):,.3f} g/mol")
+            else:
+                st.metric("분자량", "정보 없음")
+
+        with metric3:
+            st.metric("PubChem CID", str(cid))
+
+        st.markdown(
+            f"[PubChem 원본 물질 페이지 열기]"
+            f"(https://pubchem.ncbi.nlm.nih.gov/compound/{cid})"
+        )
+
+        # ----------------------------------
+        # 2D 구조
+        # ----------------------------------
+        st.divider()
+        st.subheader("🧩 2D 분자 구조")
+        st.caption("평면 구조 그림으로 원자와 결합의 배열을 관찰합니다.")
+
+        try:
+            with st.spinner("2D 구조 그림을 불러오는 중입니다..."):
+                image_data = get_2d_image(cid)
+
+            st.image(
+                image_data,
+                caption=f"{name}의 2D 구조 (출처: PubChem)",
+                width=420
+            )
+
+        except requests.RequestException:
+            st.warning("2D 구조 이미지를 불러오지 못했습니다.")
+
+        # ----------------------------------
+        # 3D 구조
+        # ----------------------------------
+        st.divider()
+        st.subheader("🧊 3D 입체 구조")
+        st.caption(
+            "마우스로 드래그하면 회전하고, 휠로 확대·축소할 수 있습니다."
+        )
+
+        try:
+            with st.spinner("3D 구조를 계산·조회하는 중입니다..."):
+                sdf_data = get_3d_structure(cid)
+
+            if sdf_data:
+                # JSON 문자열로 안전하게 전달
+                import json
+                sdf_json = json.dumps(sdf_data)
+
+                html_code = f"""
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <meta charset="utf-8">
+                    <script src="https://3Dmol.org/build/3Dmol-min.js"></script>
+                    <style>
+                        html, body {{
+                            margin: 0;
+                            padding: 0;
+                            background: #ffffff;
+                            font-family: sans-serif;
+                        }}
+                        #viewer {{
+                            width: 100%;
+                            height: 440px;
+                            position: relative;
+                            border: 1px solid #e0e6e0;
+                            border-radius: 12px;
+                            overflow: hidden;
+                        }}
+                    </style>
+                </head>
+                <body>
+                    <div id="viewer"></div>
+                    <script>
+                        const sdf = {sdf_json};
+                        const element = document.getElementById("viewer");
+                        const viewer = $3Dmol.createViewer(element, {{
+                            backgroundColor: "white"
+                        }});
+
+                        viewer.addModel(sdf, "sdf");
+                        viewer.setStyle({{}}, {{
+                            stick: {{ radius: 0.16 }},
+                            sphere: {{ scale: 0.23 }}
+                        }});
+                        viewer.zoomTo();
+                        viewer.render();
+                        viewer.zoom(0.9);
+                    </script>
+                </body>
+                </html>
+                """
+
+                components.html(
+                    html_code,
+                    height=455,
+                    scrolling=False
+                )
+
+                st.caption(
+                    "자료: PubChem 계산 3D 좌표(SDF) · "
+                    "3D 시각화: 3Dmol.js"
+                )
+
+            else:
+                st.info(
+                    "이 물질은 PubChem에서 사용할 수 있는 "
+                    "3D 구조를 찾지 못했습니다. 2D 구조를 이용해 주세요."
+                )
+
+        except requests.RequestException:
+            st.info(
+                "3D 구조를 가져오지 못했습니다. "
+                "잠시 후 다시 시도하거나 2D 구조를 확인해 주세요."
+            )
+
+    except requests.Timeout:
+        st.error("PubChem 응답 시간이 초과되었습니다. 잠시 후 다시 시도해 주세요.")
+
+    except requests.HTTPError as error:
+        status = error.response.status_code if error.response is not None else 0
+
+        if status == 404:
+            st.warning(
+                "해당 물질의 정보를 찾지 못했습니다. "
+                "물질 이름을 확인해 주세요."
+            )
+        elif status == 503:
+            st.warning(
+                "PubChem 요청이 많아 일시적으로 응답하지 않습니다. "
+                "잠시 후 다시 시도해 주세요."
+            )
+        else:
+            st.error(f"PubChem 서버 오류가 발생했습니다. (HTTP {status})")
+
+    except requests.RequestException:
+        st.error(
+            "인터넷 연결 또는 PubChem 서버를 확인해 주세요."
+        )
+
+    except (ValueError, KeyError, TypeError) as error:
+        st.error(
+            "응답 데이터를 처리하지 못했습니다. "
+            "다른 물질 이름으로 다시 시도해 주세요."
+        )
+
+# ----------------------------------
+# 하단 안내
+# ----------------------------------
+st.divider()
+st.markdown("### 💡 탐구 질문")
+st.markdown("""
+- 분자식이 같은 물질은 반드시 같은 구조를 가질까요?
+- 2D 구조와 3D 구조는 어떤 차이가 있을까요?
+- 원자의 종류와 개수가 달라지면 분자량은 어떻게 변할까요?
+""")
+
+st.caption(
+    "데이터 출처: PubChem, National Library of Medicine (NIH) · "
+    "3D 시각화: 3Dmol.js"
 )
-
-# 전일 대비 순위 변동: 양수는 상승(빨간 ↑), 음수는 하락(파란 ↓)입니다.
-def format_rank_change(value):
-    if value > 0:
-        return f"↑ {value}"
-    if value < 0:
-        return f"↓ {abs(value)}"
-    return "— 0"
-
-df["순위 변동"] = df["rankInten"].map(format_rank_change)
-df = df.sort_values("rank").reset_index(drop=True)
-
-# 1위 영화의 주요 지표 세 가지를 크게 보여 줍니다.
-first = df.iloc[0]
-st.subheader(f"🥇 {display_date} 1위 — {first['표시 영화명']}")
-c1, c2, c3 = st.columns(3)
-c1.metric("관객수", f"{first['audiCnt']:,}명")
-c2.metric("누적 관객수", f"{first['audiAcc']:,}명")
-c3.metric("스크린수", f"{first['scrnCnt']:,}개")
-
-# 순위 변동을 색으로 구분해 표에 표시합니다.
-st.subheader("📋 박스오피스 순위")
-table = df[["rank", "순위 변동", "표시 영화명", "openDt", "audiCnt", "audiAcc", "scrnCnt"]].copy()
-table.columns = ["순위", "전일 대비", "영화명", "개봉일", "관객수", "누적관객", "스크린수"]
-for column in ["관객수", "누적관객", "스크린수"]:
-    table[column] = table[column].map(lambda value: f"{value:,}")
-
-def color_rank_change(value):
-    if isinstance(value, str) and value.startswith("↑"):
-        return "color: #e53935; font-weight: bold;"
-    if isinstance(value, str) and value.startswith("↓"):
-        return "color: #1976d2; font-weight: bold;"
-    return "color: #777777;"
-
-st.dataframe(
-    table.style.map(color_rank_change, subset=["전일 대비"]),
-    hide_index=True,
-    use_container_width=True
-)
-
-# 관객수 상위 5편을 막대그래프로 표시합니다.
-st.subheader("📊 관객수 상위 5편")
-top5 = df.nlargest(5, "audiCnt").sort_values("audiCnt", ascending=True)
-chart = px.bar(
-    top5,
-    x="audiCnt",
-    y="표시 영화명",
-    orientation="h",
-    labels={"audiCnt": "관객수(명)", "표시 영화명": "영화명"},
-    text="audiCnt"
-)
-chart.update_traces(texttemplate="%{text:,}", textposition="outside", cliponaxis=False)
-chart.update_layout(
-    yaxis_title="",
-    xaxis_title="관객수(명)",
-    margin=dict(l=10, r=40, t=20, b=10)
-)
-st.plotly_chart(chart, use_container_width=True)
-
-st.caption("데이터 출처: 영화관입장권통합전산망(KOBIS) 일별 박스오피스 API")
-  
